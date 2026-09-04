@@ -12,10 +12,31 @@
     <artifactId>kafka-from-scratch</artifactId>
     <version>1.0-SNAPSHOT</version>
 
+
     <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
+
+        <maven.compiler.release>17</maven.compiler.release>
+
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <junit.version>5.13.4</junit.version>
+
     </properties>
+
+
+    <!-- Dependencies -->
+    <dependencies>
+
+        <dependency>
+
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+
+            <scope>test</scope>
+
+        </dependency>
+
+    </dependencies>
 
 </project>
