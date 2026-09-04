@@ -3,6 +3,8 @@ package com.kafka.broker;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -16,12 +18,17 @@ public class KafkaBroker {
 
     private final ExecutorService connectionPool;
 
+    private final TopicManager topicManager;
+
     private volatile boolean running;
 
     private volatile ServerSocket serverSocket;
 
-    public KafkaBroker(int port, int workerThreads) {
+    public KafkaBroker(int port, int workerThreads) throws IOException {
+        this(port, workerThreads, Paths.get("data"));
+    }
 
+    public KafkaBroker(int port, int workerThreads, Path dataDirectory) throws IOException {
         if (workerThreads <= 0) {
             throw new IllegalArgumentException("Worker thread count must be positive");
         }
@@ -30,11 +37,13 @@ public class KafkaBroker {
         this.workerThreads = workerThreads;
 
         this.connectionPool = Executors.newFixedThreadPool(workerThreads);
+
+        this.topicManager = new TopicManager(dataDirectory);
     }
 
     public void start() throws IOException {
-
         serverSocket = new ServerSocket(port);
+
         running = true;
 
         System.out.println("SimpleKafka broker started on port " + serverSocket.getLocalPort());
@@ -50,13 +59,15 @@ public class KafkaBroker {
                 System.out.println("Accepted connection #"
                                 + connectionId
                                 + " from "
-                                + clientSocket.getRemoteSocketAddress()
-                );
+                                + clientSocket
+                                .getRemoteSocketAddress());
 
                 configureSocket(clientSocket);
 
-                connectionPool.submit(
-                        new ClientConnection(connectionId, clientSocket));
+                connectionPool.submit(new ClientConnection(
+                                connectionId,
+                                clientSocket,
+                                topicManager));
             }
 
         } catch (IOException e) {
@@ -79,9 +90,14 @@ public class KafkaBroker {
         return currentSocket.getLocalPort();
     }
 
+    public TopicManager getTopicManager() {
+        return topicManager;
+    }
+
     public void shutdown() {
 
         if (!running) return;
+
         running = false;
 
         System.out.println("Shutting down broker...");
@@ -97,6 +113,12 @@ public class KafkaBroker {
 
         connectionPool.shutdown();
 
+        try {
+            topicManager.close();
+        } catch (IOException e) {
+            System.out.println("Error closing topic manager: " + e.getMessage());
+        }
+
         System.out.println("Broker stopped.");
     }
 
@@ -106,7 +128,9 @@ public class KafkaBroker {
 
         int workers = args.length > 1 ? Integer.parseInt(args[1]) : 10;
 
-        KafkaBroker broker = new KafkaBroker(port, workers);
+        Path dataDirectory = args.length > 2 ? Paths.get(args[2]) : Paths.get("data");
+
+        KafkaBroker broker = new KafkaBroker(port, workers, dataDirectory);
 
         Runtime.getRuntime().addShutdownHook(new Thread(broker::shutdown));
 
