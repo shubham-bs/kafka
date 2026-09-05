@@ -11,6 +11,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class KafkaBroker {
 
+    private static final long FAILURE_DETECTION_INTERVAL_MILLIS =
+            1000L;
+
     private final int brokerId;
     private final int port;
     private final int workerThreads;
@@ -26,11 +29,15 @@ public class KafkaBroker {
 
     private final ReplicationManager replicationManager;
 
+    private final FailureDetector failureDetector;
+
     private volatile boolean running;
 
     private volatile ServerSocket serverSocket;
 
-    public KafkaBroker(int port, int workerThreads)
+    public KafkaBroker(
+            int port,
+            int workerThreads)
             throws IOException {
 
         this(
@@ -63,18 +70,21 @@ public class KafkaBroker {
             throws IOException {
 
         if (brokerId < 0) {
+
             throw new IllegalArgumentException(
                     "Broker ID cannot be negative"
             );
         }
 
         if (port < 0 || port > 65535) {
+
             throw new IllegalArgumentException(
                     "Invalid broker port: " + port
             );
         }
 
         if (workerThreads <= 0) {
+
             throw new IllegalArgumentException(
                     "Worker thread count must be positive"
             );
@@ -85,15 +95,15 @@ public class KafkaBroker {
         this.workerThreads = workerThreads;
 
         this.connectionPool =
-                Executors.newFixedThreadPool(workerThreads);
+                Executors.newFixedThreadPool(
+                        workerThreads
+                );
 
         this.topicManager =
-                new TopicManager(dataDirectory);
+                new TopicManager(
+                        dataDirectory
+                );
 
-        /*
-         * Both KafkaBroker and ReplicationManager must
-         * reference the SAME ClusterMetadata instance.
-         */
         this.clusterMetadata =
                 new ClusterMetadata();
 
@@ -103,13 +113,27 @@ public class KafkaBroker {
                         dataDirectory,
                         clusterMetadata
                 );
+
+        this.failureDetector =
+                new FailureDetector(
+                        brokerId,
+                        clusterMetadata,
+                        replicationManager,
+                        FAILURE_DETECTION_INTERVAL_MILLIS
+                );
     }
 
-    public void start() throws IOException {
+    public void start()
+            throws IOException {
 
-        serverSocket = new ServerSocket(port);
+        serverSocket =
+                new ServerSocket(port);
 
         running = true;
+
+        clusterMetadata.markBrokerAlive(
+                brokerId
+        );
 
         System.out.println(
                 "SimpleKafka broker "
@@ -122,6 +146,8 @@ public class KafkaBroker {
                 "Connection worker threads: "
                         + workerThreads
         );
+
+        failureDetector.start();
 
         try {
 
@@ -142,7 +168,9 @@ public class KafkaBroker {
                                 .getRemoteSocketAddress()
                 );
 
-                configureSocket(clientSocket);
+                configureSocket(
+                        clientSocket
+                );
 
                 connectionPool.submit(
                         new ClientConnection(
@@ -211,6 +239,12 @@ public class KafkaBroker {
 
         running = false;
 
+        clusterMetadata.markBrokerDead(
+                brokerId
+        );
+
+        failureDetector.close();
+
         System.out.println(
                 "Shutting down broker..."
         );
@@ -221,6 +255,7 @@ public class KafkaBroker {
         if (currentSocket != null) {
 
             try {
+
                 currentSocket.close();
 
             } catch (IOException ignored) {

@@ -1,559 +1,174 @@
 package com.kafka.broker;
 
-import com.kafka.protocol.FetchRequest;
-import com.kafka.protocol.ProduceRequest;
-import com.kafka.protocol.ProtocolDecoder;
-import com.kafka.protocol.ProtocolEncoder;
-import com.kafka.protocol.ProtocolFrame;
-import com.kafka.protocol.RequestType;
+import com.kafka.protocol.*;
 import com.kafka.storage.LogRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.*;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.List;
+import java.nio.file.*;
+import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ReplicationIntegrationTest {
-
-    @TempDir
-    Path tempDir;
+    @TempDir Path tempDir;
 
     @Test
-    void shouldReplicateAcrossThreeLiveBrokers()
-            throws Exception {
-
-        KafkaBroker broker0 =
-                createBroker(0);
-
-        KafkaBroker broker1 =
-                createBroker(1);
-
-        KafkaBroker broker2 =
-                createBroker(2);
-
-        Thread broker0Thread =
-                startBroker(broker0);
-
-        Thread broker1Thread =
-                startBroker(broker1);
-
-        Thread broker2Thread =
-                startBroker(broker2);
-
+    void shouldReplicateAcrossThreeLiveBrokers() throws Exception {
+        KafkaBroker[] b = brokers();
         try {
+            startAndRegister(b);
+            configure(b);
+            byte[] first = bytes("message-from-leader");
+            assertEquals(0, produce(b[0].getPort(), first));
+            waitForReplica(b[1], first, 0);
+            waitForReplica(b[2], first, 0);
+            assertRecord(b[1], first, 0);
+            assertRecord(b[2], first, 0);
 
-            waitForBroker(broker0);
-            waitForBroker(broker1);
-            waitForBroker(broker2);
+            byte[] second = bytes("message-through-follower");
+            assertEquals(1, produce(b[1].getPort(), second));
+            waitForReplica(b[1], second, 1);
+            waitForReplica(b[2], second, 1);
+            assertRecord(b[0], second, 1);
+            assertRecord(fetch(b[2].getPort(), 1), second, 1);
+        } finally { shutdown(b); }
+    }
 
-            registerCluster(
-                    broker0,
-                    broker1,
-                    broker2
-            );
+    @Test
+    void shouldFailoverToBrokerOneAfterLeaderFailure() throws Exception {
+        KafkaBroker[] b = brokers();
+        try {
+            startAndRegister(b);
+            configure(b);
+            byte[] first = bytes("before-failure");
+            assertEquals(0, produce(b[0].getPort(), first));
+            waitForReplica(b[1], first, 0);
+            waitForReplica(b[2], first, 0);
 
-            configurePartition(broker0);
-            configurePartition(broker1);
-            configurePartition(broker2);
+            b[0].shutdown();
+            waitForLeaderElection(b[1], 1);
+            assertTrue(b[1].getReplicationManager().getLocalReplica("orders", 0).isLeader());
 
-            /*
-             * -------------------------------------------------
-             * TEST 1
-             *
-             * Direct produce to leader.
-             * Broker 0 should replicate to 1 and 2.
-             * -------------------------------------------------
-             */
+            byte[] second = bytes("after-failure");
+            assertEquals(1, produce(b[1].getPort(), second));
+            waitForReplica(b[2], second, 1);
+            assertRecord(b[1], second, 1);
+            assertRecord(b[2], second, 1);
+            assertRecord(fetch(b[1].getPort(), 1), second, 1);
+        } finally { shutdown(b); }
+    }
 
-            byte[] firstMessage =
-                    "message-from-leader"
-                            .getBytes(StandardCharsets.UTF_8);
-
-            long firstOffset =
-                    produce(
-                            broker0.getPort(),
-                            "orders",
-                            0,
-                            firstMessage
-                    );
-
-            assertEquals(0, firstOffset);
-
-            waitForReplica(
-                    broker1,
-                    firstMessage,
-                    0
-            );
-
-            waitForReplica(
-                    broker2,
-                    firstMessage,
-                    0
-            );
-
-            /*
-             * Verify follower 1.
-             */
-            LogRecord broker1Record =
-                    broker1
-                            .getReplicationManager()
-                            .fetchLocally(
-                                    "orders",
-                                    0,
-                                    0
-                            );
-
-            assertNotNull(broker1Record);
-
-            assertArrayEquals(
-                    firstMessage,
-                    broker1Record.getPayload()
-            );
-
-            /*
-             * Verify follower 2.
-             */
-            LogRecord broker2Record =
-                    broker2
-                            .getReplicationManager()
-                            .fetchLocally(
-                                    "orders",
-                                    0,
-                                    0
-                            );
-
-            assertNotNull(broker2Record);
-
-            assertArrayEquals(
-                    firstMessage,
-                    broker2Record.getPayload()
-            );
-
-            /*
-             * -------------------------------------------------
-             * TEST 2
-             *
-             * Produce through follower Broker 1.
-             *
-             * Broker 1 must forward PRODUCE to Broker 0.
-             * Broker 0 produces and replicates the record.
-             * -------------------------------------------------
-             */
-
-            byte[] secondMessage =
-                    "message-through-follower"
-                            .getBytes(StandardCharsets.UTF_8);
-
-            long secondOffset =
-                    produce(
-                            broker1.getPort(),
-                            "orders",
-                            0,
-                            secondMessage
-                    );
-
-            assertEquals(1, secondOffset);
-
-            waitForReplica(
-                    broker1,
-                    secondMessage,
-                    1
-            );
-
-            waitForReplica(
-                    broker2,
-                    secondMessage,
-                    1
-            );
-
-            /*
-             * Leader should contain the second record.
-             */
-            LogRecord leaderRecord =
-                    broker0
-                            .getReplicationManager()
-                            .fetchLocally(
-                                    "orders",
-                                    0,
-                                    1
-                            );
-
-            assertNotNull(leaderRecord);
-
-            assertArrayEquals(
-                    secondMessage,
-                    leaderRecord.getPayload()
-            );
-
-            /*
-             * -------------------------------------------------
-             * TEST 3
-             *
-             * Fetch through follower Broker 2.
-             *
-             * Broker 2 must forward FETCH to Broker 0.
-             * -------------------------------------------------
-             */
-
-            LogRecord fetched =
-                    fetch(
-                            broker2.getPort(),
-                            "orders",
-                            0,
-                            1
-                    );
-
-            assertNotNull(fetched);
-
-            assertEquals(
-                    1,
-                    fetched.getOffset()
-            );
-
-            assertArrayEquals(
-                    secondMessage,
-                    fetched.getPayload()
-            );
-
-        } finally {
-
-            broker0.shutdown();
-            broker1.shutdown();
-            broker2.shutdown();
-
-            broker0Thread.join(2000);
-            broker1Thread.join(2000);
-            broker2Thread.join(2000);
+    private KafkaBroker[] brokers() throws Exception {
+        KafkaBroker[] result = new KafkaBroker[3];
+        for (int i = 0; i < result.length; i++) {
+            Path dir = tempDir.resolve("broker-" + i);
+            Files.createDirectories(dir);
+            result[i] = new KafkaBroker(i, 0, 4, dir);
         }
+        return result;
     }
 
-    private KafkaBroker createBroker(
-            int brokerId)
-            throws Exception {
-
-        Path dataDirectory =
-                tempDir.resolve(
-                        "broker-" + brokerId
-                );
-
-        Files.createDirectories(
-                dataDirectory
-        );
-
-        return new KafkaBroker(
-                brokerId,
-                0,
-                4,
-                dataDirectory
-        );
+    private void startAndRegister(KafkaBroker[] b) throws Exception {
+        Thread[] threads = new Thread[b.length];
+        for (int i = 0; i < b.length; i++) threads[i] = startBroker(b[i]);
+        for (KafkaBroker broker : b) waitForBroker(broker);
+        BrokerInfo[] info = new BrokerInfo[b.length];
+        for (int i = 0; i < b.length; i++) info[i] = new BrokerInfo(i, "127.0.0.1", b[i].getPort());
+        for (KafkaBroker broker : b) for (BrokerInfo x : info) broker.getClusterMetadata().addBroker(x);
     }
 
-    private void registerCluster(
-            KafkaBroker broker0,
-            KafkaBroker broker1,
-            KafkaBroker broker2) {
-
-        BrokerInfo info0 =
-                new BrokerInfo(
-                        0,
-                        "127.0.0.1",
-                        broker0.getPort()
-                );
-
-        BrokerInfo info1 =
-                new BrokerInfo(
-                        1,
-                        "127.0.0.1",
-                        broker1.getPort()
-                );
-
-        BrokerInfo info2 =
-                new BrokerInfo(
-                        2,
-                        "127.0.0.1",
-                        broker2.getPort()
-                );
-
-        registerBroker(
-                broker0,
-                info0,
-                info1,
-                info2
-        );
-
-        registerBroker(
-                broker1,
-                info0,
-                info1,
-                info2
-        );
-
-        registerBroker(
-                broker2,
-                info0,
-                info1,
-                info2
-        );
+    private void configure(KafkaBroker[] b) throws Exception {
+        for (KafkaBroker broker : b)
+            broker.getReplicationManager().createPartitionReplica("orders", 0, List.of(0, 1, 2), 0);
     }
 
-    private void registerBroker(
-            KafkaBroker broker,
-            BrokerInfo... brokers) {
-
-        for (BrokerInfo info : brokers) {
-
-            broker.getClusterMetadata()
-                    .addBroker(info);
-        }
+    private Thread startBroker(KafkaBroker broker) {
+        Thread t = new Thread(() -> {
+            try { broker.start(); } catch (Exception e) { throw new RuntimeException(e); }
+        });
+        t.start();
+        return t;
     }
 
-    private void configurePartition(
-            KafkaBroker broker)
-            throws Exception {
-
-        broker.getReplicationManager()
-                .createPartitionReplica(
-                        "orders",
-                        0,
-                        List.of(0, 1, 2),
-                        0
-                );
+    private void waitForBroker(KafkaBroker broker) throws Exception {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (broker.getPort() <= 0 && System.currentTimeMillis() < deadline) Thread.sleep(10);
+        if (broker.getPort() <= 0) fail("Broker " + broker.getBrokerId() + " failed to start");
     }
 
-    private Thread startBroker(
-            KafkaBroker broker) {
-
-        Thread thread =
-                new Thread(() -> {
-
-                    try {
-                        broker.start();
-
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-        thread.start();
-
-        return thread;
-    }
-
-    private void waitForBroker(
-            KafkaBroker broker)
-            throws Exception {
-
-        long deadline =
-                System.currentTimeMillis()
-                        + 5000;
-
-        while (broker.getPort() <= 0) {
-
-            if (System.currentTimeMillis()
-                    > deadline) {
-
-                fail(
-                        "Broker "
-                                + broker.getBrokerId()
-                                + " failed to start"
-                );
-            }
-
-            Thread.sleep(10);
-        }
-    }
-
-    private long produce(
-            int port,
-            String topic,
-            int partition,
-            byte[] payload)
-            throws Exception {
-
-        ProduceRequest requestPayload =
-                new ProduceRequest(
-                        topic,
-                        partition,
-                        payload
-                );
-
-        ProtocolFrame request =
-                new ProtocolFrame(
-                        ProtocolFrame.CURRENT_VERSION,
-                        RequestType.PRODUCE,
-                        1,
-                        requestPayload.encode()
-                );
-
-        ProtocolFrame response =
-                send(
-                        port,
-                        request
-                );
-
-        assertEquals(
-                RequestType.PRODUCE,
-                response.getRequestType()
-        );
-
-        assertEquals(
-                Long.BYTES,
-                response.getPayload().length
-        );
-
-        return ByteBuffer
-                .wrap(response.getPayload())
-                .getLong();
-    }
-
-    private LogRecord fetch(
-            int port,
-            String topic,
-            int partition,
-            long offset)
-            throws Exception {
-
-        FetchRequest requestPayload =
-                new FetchRequest(
-                        topic,
-                        partition,
-                        offset
-                );
-
-        ProtocolFrame request =
-                new ProtocolFrame(
-                        ProtocolFrame.CURRENT_VERSION,
-                        RequestType.FETCH,
-                        2,
-                        requestPayload.encode()
-                );
-
-        ProtocolFrame response =
-                send(
-                        port,
-                        request
-                );
-
-        assertEquals(
-                RequestType.FETCH,
-                response.getRequestType()
-        );
-
-        byte[] payload =
-                response.getPayload();
-
-        if (payload.length == Long.BYTES) {
-            long responseOffset =
-                    ByteBuffer
-                            .wrap(payload)
-                            .getLong();
-
-            if (responseOffset == -1) {
-                return null;
-            }
-        }
-
-        ByteBuffer buffer =
-                ByteBuffer.wrap(payload);
-
-        long responseOffset =
-                buffer.getLong();
-
-        int messageLength =
-                buffer.getInt();
-
-        byte[] message =
-                new byte[messageLength];
-
-        buffer.get(message);
-
-        return new LogRecord(
-                responseOffset,
-                message
-        );
-    }
-
-    private void waitForReplica(
-            KafkaBroker broker,
-            byte[] expected,
-            long offset)
-            throws Exception {
-
-        long deadline =
-                System.currentTimeMillis()
-                        + 5000;
-
-        while (System.currentTimeMillis()
-                < deadline) {
-
-            LogRecord record =
-                    broker
-                            .getReplicationManager()
-                            .fetchLocally(
-                                    "orders",
-                                    0,
-                                    offset
-                            );
-
-            if (record != null
-                    && java.util.Arrays.equals(
-                    expected,
-                    record.getPayload()
-            )) {
-
-                return;
-            }
-
+    private void waitForLeaderElection(KafkaBroker broker, int expected) throws Exception {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            if (broker.getClusterMetadata().getLeaderBrokerId("orders", 0) == expected) return;
             Thread.sleep(20);
         }
-
-        fail(
-                "Broker "
-                        + broker.getBrokerId()
-                        + " did not receive replica"
-        );
+        fail("Broker " + broker.getBrokerId() + " did not elect broker " + expected + " as leader");
     }
 
-    private ProtocolFrame send(
-            int port,
-            ProtocolFrame request)
-            throws Exception {
+    private long produce(int port, byte[] payload) throws Exception {
+        ProduceRequest body = new ProduceRequest("orders", 0, payload);
+        ProtocolFrame request = frame(RequestType.PRODUCE, 1, body.encode());
+        ProtocolFrame response = send(port, request);
+        assertEquals(RequestType.PRODUCE, response.getRequestType());
+        assertEquals(Long.BYTES, response.getPayload().length);
+        return ByteBuffer.wrap(response.getPayload()).getLong();
+    }
 
-        try (Socket socket =
-                     new Socket(
-                             "127.0.0.1",
-                             port
-                     )) {
+    private LogRecord fetch(int port, long offset) throws Exception {
+        FetchRequest body = new FetchRequest("orders", 0, offset);
+        ProtocolFrame response = send(port, frame(RequestType.FETCH, 2, body.encode()));
+        assertEquals(RequestType.FETCH, response.getRequestType());
+        ByteBuffer buffer = ByteBuffer.wrap(response.getPayload());
+        long responseOffset = buffer.getLong();
+        if (responseOffset == -1) return null;
+        int length = buffer.getInt();
+        byte[] message = new byte[length];
+        buffer.get(message);
+        return new LogRecord(responseOffset, message);
+    }
 
+    private ProtocolFrame frame(RequestType type, int correlation, byte[] payload) {
+        return new ProtocolFrame(ProtocolFrame.CURRENT_VERSION, type, correlation, payload);
+    }
+
+    private ProtocolFrame send(int port, ProtocolFrame request) throws Exception {
+        try (Socket socket = new Socket("127.0.0.1", port);
+             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+             DataInputStream in = new DataInputStream(socket.getInputStream())) {
             socket.setSoTimeout(5000);
-
-            DataOutputStream output =
-                    new DataOutputStream(
-                            socket.getOutputStream()
-                    );
-
-            DataInputStream input =
-                    new DataInputStream(
-                            socket.getInputStream()
-                    );
-
-            ProtocolEncoder encoder =
-                    new ProtocolEncoder(output);
-
-            ProtocolDecoder decoder =
-                    new ProtocolDecoder(input);
-
-            encoder.writeFrame(request);
-
-            return decoder.readFrame();
+            new ProtocolEncoder(out).writeFrame(request);
+            return new ProtocolDecoder(in).readFrame();
         }
+    }
+
+    private void waitForReplica(KafkaBroker broker, byte[] expected, long offset) throws Exception {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            LogRecord record = broker.getReplicationManager().fetchLocally("orders", 0, offset);
+            if (record != null && Arrays.equals(expected, record.getPayload())) return;
+            Thread.sleep(20);
+        }
+        fail("Broker " + broker.getBrokerId() + " did not receive replica");
+    }
+
+    private void assertRecord(KafkaBroker broker, byte[] expected, long offset) throws Exception {
+        assertRecord(broker.getReplicationManager().fetchLocally("orders", 0, offset), expected, offset);
+    }
+
+    private void assertRecord(LogRecord record, byte[] expected, long offset) {
+        assertNotNull(record);
+        assertEquals(offset, record.getOffset());
+        assertArrayEquals(expected, record.getPayload());
+    }
+
+    private byte[] bytes(String value) { return value.getBytes(StandardCharsets.UTF_8); }
+
+    private void shutdown(KafkaBroker[] b) throws InterruptedException {
+        for (KafkaBroker broker : b) broker.shutdown();
     }
 }

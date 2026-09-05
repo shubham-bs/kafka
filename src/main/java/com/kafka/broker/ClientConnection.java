@@ -1,35 +1,22 @@
 package com.kafka.broker;
 
-import com.kafka.protocol.FetchRequest;
-import com.kafka.protocol.ProduceRequest;
-import com.kafka.protocol.ProtocolDecoder;
-import com.kafka.protocol.ProtocolEncoder;
-import com.kafka.protocol.ProtocolFrame;
-import com.kafka.protocol.ReplicateRequest;
-import com.kafka.protocol.RequestType;
+import com.kafka.protocol.*;
 import com.kafka.storage.LogRecord;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 public class ClientConnection implements Runnable {
-
     private final int connectionId;
     private final Socket socket;
     private final TopicManager topicManager;
     private final ReplicationManager replicationManager;
     private final ClusterMetadata clusterMetadata;
 
-    public ClientConnection(
-            int connectionId,
-            Socket socket,
-            TopicManager topicManager,
-            ReplicationManager replicationManager,
-            ClusterMetadata clusterMetadata) {
-
+    public ClientConnection(int connectionId, Socket socket, TopicManager topicManager,
+                            ReplicationManager replicationManager, ClusterMetadata clusterMetadata) {
         this.connectionId = connectionId;
         this.socket = socket;
         this.topicManager = topicManager;
@@ -38,52 +25,33 @@ public class ClientConnection implements Runnable {
     }
 
     public ClientConnection(int connectionId, Socket socket, TopicManager topicManager) {
-
-        this(
-                connectionId,
-                socket,
-                topicManager,
-                null,
-                null
-        );
+        this(connectionId, socket, topicManager, null, null);
     }
 
     @Override
     public void run() {
-
-        try (
-                Socket client = socket;
-                InputStream input = client.getInputStream();
-                OutputStream output = client.getOutputStream()
-        ) {
+        try (Socket client = socket;
+             InputStream input = client.getInputStream();
+             OutputStream output = client.getOutputStream()) {
 
             ProtocolDecoder decoder = new ProtocolDecoder(input);
-
             ProtocolEncoder encoder = new ProtocolEncoder(output);
 
             while (true) {
                 ProtocolFrame request;
-
                 try {
                     request = decoder.readFrame();
                 } catch (IOException e) {
                     break;
                 }
-
                 handleRequest(request, encoder);
             }
-
         } catch (IOException e) {
-
-            System.out.println("Connection #"
-                            + connectionId
-                            + " closed: "
-                            + e.getMessage());
+            System.out.println("Connection #" + connectionId + " closed: " + e.getMessage());
         }
     }
 
     private void handleRequest(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
-
         switch (request.getRequestType()) {
             case PING -> handlePing(request, encoder);
             case PRODUCE -> handleProduce(request, encoder);
@@ -93,319 +61,210 @@ public class ClientConnection implements Runnable {
     }
 
     private void handlePing(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
-
-        byte[] payload = "PONG".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-
-        encoder.writeFrame(new ProtocolFrame(
-                        ProtocolFrame.CURRENT_VERSION,
-                        RequestType.PING,
-                        request.getCorrelationId(),
-                        payload));
+        write(request, encoder, RequestType.PING, "PONG".getBytes(StandardCharsets.UTF_8));
     }
 
     private void handleProduce(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
-
         try {
-            ProduceRequest produceRequest = ProduceRequest.decode(request.getPayload());
+            ProduceRequest r = ProduceRequest.decode(request.getPayload());
 
-            if (replicationManager == null || clusterMetadata == null) {
-
-                sendProduceResponse(
-                        request,
-                        encoder,
-                        topicManager.produce(
-                                produceRequest.getTopic(),
-                                produceRequest.getPartition(),
-                                produceRequest.getPayload()
-                        )
-                );
-
+            if (!clustered()) {
+                sendProduceResponse(request, encoder,
+                        topicManager.produce(r.getTopic(), r.getPartition(), r.getPayload()));
                 return;
             }
 
-            PartitionMetadata metadata = clusterMetadata.getPartition(
-                            produceRequest.getTopic(),
-                            produceRequest.getPartition()
-                    );
+            PartitionMetadata metadata =
+                    clusterMetadata.getPartition(r.getTopic(), r.getPartition());
 
             if (metadata == null) {
-
-                sendProduceResponse(
-                        request,
-                        encoder,
-                        topicManager.produce(
-                                produceRequest.getTopic(),
-                                produceRequest.getPartition(),
-                                produceRequest.getPayload()
-                        )
-                );
-
+                sendProduceResponse(request, encoder,
+                        topicManager.produce(r.getTopic(), r.getPartition(), r.getPayload()));
                 return;
             }
 
-            int leaderId = metadata.getLeaderBrokerId();
+            ensureLeaderAvailable(metadata);
 
-            if (leaderId != replicationManager.getBrokerId()) {
-
-                ProtocolFrame response =
-                        forwardToLeader(
-                                metadata,
-                                request
-                        );
-
-                encoder.writeFrame(response);
+            ProtocolFrame forwarded = forwardIfNeeded(metadata, request);
+            if (forwarded != null) {
+                encoder.writeFrame(forwarded);
                 return;
             }
 
             long offset = replicationManager.produceLocally(
-                            produceRequest.getTopic(),
-                            produceRequest.getPartition(),
-                            produceRequest.getPayload()
-                    );
+                    r.getTopic(), r.getPartition(), r.getPayload());
 
             replicationManager.replicate(
-                    produceRequest.getTopic(),
-                    produceRequest.getPartition(),
-                    offset,
-                    produceRequest.getPayload()
-            );
+                    r.getTopic(), r.getPartition(), offset, r.getPayload());
 
-            sendProduceResponse(
-                    request,
-                    encoder,
-                    offset
-            );
-
+            sendProduceResponse(request, encoder, offset);
         } catch (IllegalArgumentException | IllegalStateException e) {
-
-            sendErrorResponse(
-                    request,
-                    encoder,
-                    e.getMessage()
-            );
+            sendErrorResponse(request, encoder, e.getMessage());
         }
     }
 
     private void handleFetch(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
-
         try {
+            FetchRequest r = FetchRequest.decode(request.getPayload());
 
-            FetchRequest fetchRequest = FetchRequest.decode(request.getPayload());
-
-            if (replicationManager == null || clusterMetadata == null) {
-
-                sendFetchResponse(
-                        request,
-                        encoder,
-                        topicManager.fetch(
-                                fetchRequest.getTopic(),
-                                fetchRequest.getPartition(),
-                                fetchRequest.getOffset()
-                        )
-                );
-
+            if (!clustered()) {
+                sendFetchResponse(request, encoder,
+                        topicManager.fetch(r.getTopic(), r.getPartition(), r.getOffset()));
                 return;
             }
 
-            PartitionMetadata metadata = clusterMetadata.getPartition(
-                            fetchRequest.getTopic(),
-                            fetchRequest.getPartition()
-                    );
+            PartitionMetadata metadata =
+                    clusterMetadata.getPartition(r.getTopic(), r.getPartition());
 
             if (metadata == null) {
-
-                sendFetchResponse(
-                        request,
-                        encoder,
-                        topicManager.fetch(
-                                fetchRequest.getTopic(),
-                                fetchRequest.getPartition(),
-                                fetchRequest.getOffset()
-                        )
-                );
-
+                sendFetchResponse(request, encoder,
+                        topicManager.fetch(r.getTopic(), r.getPartition(), r.getOffset()));
                 return;
             }
 
-            if (metadata.getLeaderBrokerId() != replicationManager.getBrokerId()) {
+            ensureLeaderAvailable(metadata);
 
-                ProtocolFrame response =
-                        forwardToLeader(
-                                metadata,
-                                request
-                        );
-
-                encoder.writeFrame(response);
+            ProtocolFrame forwarded = forwardIfNeeded(metadata, request);
+            if (forwarded != null) {
+                encoder.writeFrame(forwarded);
                 return;
             }
 
             LogRecord record = replicationManager.fetchLocally(
-                            fetchRequest.getTopic(),
-                            fetchRequest.getPartition(),
-                            fetchRequest.getOffset()
-                    );
+                    r.getTopic(), r.getPartition(), r.getOffset());
 
-            if (record == null) {
-                sendFetchResponse(
-                        request,
-                        encoder,
-                        null
-                );
-
-            } else {
-                sendFetchResponse(
-                        request,
-                        encoder,
-                        new FetchResult(
-                                fetchRequest.getOffset(),
-                                record.getPayload()
-                        )
-                );
-            }
-
+            sendFetchResponse(request, encoder,
+                    record == null ? null : new FetchResult(r.getOffset(), record.getPayload()));
         } catch (IllegalArgumentException | IllegalStateException e) {
-
-            sendErrorResponse(
-                    request,
-                    encoder,
-                    e.getMessage()
-            );
+            sendErrorResponse(request, encoder, e.getMessage());
         }
     }
 
     private void handleReplicate(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
-
         try {
             if (replicationManager == null) {
                 throw new IllegalStateException("Replication is not enabled");
             }
 
-            ReplicateRequest replicateRequest = ReplicateRequest.decode(request.getPayload());
-
+            ReplicateRequest r = ReplicateRequest.decode(request.getPayload());
             replicationManager.appendReplica(
-                    replicateRequest.getTopic(),
-                    replicateRequest.getPartition(),
-                    replicateRequest.getOffset(),
-                    replicateRequest.getPayload()
-            );
+                    r.getTopic(), r.getPartition(), r.getOffset(), r.getPayload());
 
-            byte[] responsePayload = ByteBuffer
-                            .allocate(Long.BYTES)
-                            .putLong(
-                                    replicateRequest.getOffset()
-                            )
-                            .array();
+            byte[] payload = ByteBuffer.allocate(Long.BYTES)
+                    .putLong(r.getOffset())
+                    .array();
 
-            encoder.writeFrame(new ProtocolFrame(
-                            ProtocolFrame.CURRENT_VERSION,
-                            RequestType.REPLICATE,
-                            request.getCorrelationId(),
-                            responsePayload
-                    )
-            );
-
+            write(request, encoder, RequestType.REPLICATE, payload);
         } catch (IllegalArgumentException | IllegalStateException e) {
-
-            sendErrorResponse(
-                    request,
-                    encoder,
-                    e.getMessage()
-            );
+            sendErrorResponse(request, encoder, e.getMessage());
         }
     }
 
-    private ProtocolFrame forwardToLeader(PartitionMetadata metadata, ProtocolFrame request)
-            throws IOException {
+    private boolean clustered() {
+        return replicationManager != null && clusterMetadata != null;
+    }
 
-        int leaderId = metadata.getLeaderBrokerId();
-
-        BrokerInfo leader = clusterMetadata.getBroker(leaderId);
-
-        if (leader == null) {
-            throw new IOException("Leader broker not found: " + leaderId);
+    private void ensureLeaderAvailable(PartitionMetadata metadata) {
+        int leader = metadata.getLeaderBrokerId();
+        if (clusterMetadata.isBrokerAlive(leader)) {
+            return;
         }
 
-        if (leader.getPort() <= 0) {
+        int elected = clusterMetadata.electLeader(
+                metadata.getTopic(), metadata.getPartition());
+
+        replicationManager.setLeader(
+                metadata.getTopic(), metadata.getPartition(), elected);
+    }
+
+    private ProtocolFrame forwardIfNeeded(
+            PartitionMetadata metadata, ProtocolFrame request) throws IOException {
+
+        if (metadata.getLeaderBrokerId() == replicationManager.getBrokerId()) {
+            return null;
+        }
+
+        int leaderId = metadata.getLeaderBrokerId();
+        BrokerInfo leader = clusterMetadata.getBroker(leaderId);
+
+        if (leader == null || leader.getPort() <= 0) {
             throw new IOException("Leader broker is not running: " + leaderId);
         }
 
-        return BrokerClient.request(leader, request);
+        try {
+            return BrokerClient.request(leader, request);
+        } catch (IOException e) {
+            clusterMetadata.markBrokerDead(leaderId);
+
+            int elected = clusterMetadata.electLeader(
+                    metadata.getTopic(), metadata.getPartition());
+
+            replicationManager.setLeader(
+                    metadata.getTopic(), metadata.getPartition(), elected);
+
+            if (elected == replicationManager.getBrokerId()) {
+                return null;
+            }
+
+            BrokerInfo newLeader = clusterMetadata.getBroker(elected);
+            if (newLeader == null || newLeader.getPort() <= 0) {
+                throw new IOException("Elected leader is not running: " + elected);
+            }
+
+            return BrokerClient.request(newLeader, request);
+        }
     }
 
     private void sendProduceResponse(
-            ProtocolFrame request,
-            ProtocolEncoder encoder,
-            long offset)
-            throws IOException {
+            ProtocolFrame request, ProtocolEncoder encoder, long offset) throws IOException {
 
-        byte[] payload = ByteBuffer
-                        .allocate(Long.BYTES)
-                        .putLong(offset)
-                        .array();
+        byte[] payload = ByteBuffer.allocate(Long.BYTES)
+                .putLong(offset)
+                .array();
 
-        encoder.writeFrame(new ProtocolFrame(
-                        ProtocolFrame.CURRENT_VERSION,
-                        RequestType.PRODUCE,
-                        request.getCorrelationId(),
-                        payload
-                )
-        );
+        write(request, encoder, RequestType.PRODUCE, payload);
     }
 
     private void sendFetchResponse(
-            ProtocolFrame request,
-            ProtocolEncoder encoder,
-            FetchResult result)
-            throws IOException {
+            ProtocolFrame request, ProtocolEncoder encoder, FetchResult result) throws IOException {
 
-        byte[] responsePayload;
+        byte[] payload;
 
         if (result == null) {
-
-            responsePayload = ByteBuffer
-                            .allocate(Long.BYTES)
-                            .putLong(-1L)
-                            .array();
-
+            payload = ByteBuffer.allocate(Long.BYTES)
+                    .putLong(-1L)
+                    .array();
         } else {
-
             byte[] message = result.getPayload();
 
-            responsePayload = ByteBuffer
-                            .allocate(
-                                    Long.BYTES
-                                            + Integer.BYTES
-                                            + message.length
-                            )
-                            .putLong(result.getOffset())
-                            .putInt(message.length)
-                            .put(message)
-                            .array();
+            payload = ByteBuffer.allocate(
+                            Long.BYTES + Integer.BYTES + message.length)
+                    .putLong(result.getOffset())
+                    .putInt(message.length)
+                    .put(message)
+                    .array();
         }
 
-        encoder.writeFrame(new ProtocolFrame(
-                        ProtocolFrame.CURRENT_VERSION,
-                        RequestType.FETCH,
-                        request.getCorrelationId(),
-                        responsePayload
-                )
-        );
+        write(request, encoder, RequestType.FETCH, payload);
     }
 
     private void sendErrorResponse(
+            ProtocolFrame request, ProtocolEncoder encoder, String message) throws IOException {
+
+        write(request, encoder, request.getRequestType(),
+                message.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void write(
             ProtocolFrame request,
             ProtocolEncoder encoder,
-            String message)
-            throws IOException {
-
-        byte[] payload = message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            RequestType type,
+            byte[] payload) throws IOException {
 
         encoder.writeFrame(new ProtocolFrame(
-                        ProtocolFrame.CURRENT_VERSION,
-                        request.getRequestType(),
-                        request.getCorrelationId(),
-                        payload
-                )
-        );
+                ProtocolFrame.CURRENT_VERSION,
+                type,
+                request.getCorrelationId(),
+                payload));
     }
 }

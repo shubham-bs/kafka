@@ -60,7 +60,9 @@ public class ReplicationManager implements AutoCloseable {
         this.dataDirectory = dataDirectory;
         this.clusterMetadata = clusterMetadata;
 
-        Files.createDirectories(dataDirectory);
+        Files.createDirectories(
+                dataDirectory
+        );
     }
 
     public int getBrokerId() {
@@ -82,10 +84,17 @@ public class ReplicationManager implements AutoCloseable {
                         replicaBrokerIds
                 );
 
-        String key = key(topic, partition);
+        String key =
+                key(topic, partition);
 
-        metadata.put(key, partitionMetadata);
-        clusterMetadata.addPartition(partitionMetadata);
+        metadata.put(
+                key,
+                partitionMetadata
+        );
+
+        clusterMetadata.addPartition(
+                partitionMetadata
+        );
 
         if (replicaBrokerIds.contains(brokerId)) {
 
@@ -140,10 +149,14 @@ public class ReplicationManager implements AutoCloseable {
             int partition) {
 
         PartitionMetadata m =
-                getMetadata(topic, partition);
+                getMetadata(
+                        topic,
+                        partition
+                );
 
         return m != null
-                && m.getLeaderBrokerId() == brokerId;
+                && m.getLeaderBrokerId()
+                == brokerId;
     }
 
     public long produceLocally(
@@ -153,15 +166,20 @@ public class ReplicationManager implements AutoCloseable {
             throws IOException {
 
         PartitionReplica replica =
-                getLocalReplica(topic, partition);
+                getLocalReplica(
+                        topic,
+                        partition
+                );
 
         if (replica == null) {
+
             throw new IllegalArgumentException(
                     "Partition replica not found"
             );
         }
 
         if (!replica.isLeader()) {
+
             throw new IllegalStateException(
                     "Broker is not partition leader"
             );
@@ -177,15 +195,21 @@ public class ReplicationManager implements AutoCloseable {
             throws IOException {
 
         PartitionReplica replica =
-                getLocalReplica(topic, partition);
+                getLocalReplica(
+                        topic,
+                        partition
+                );
 
         if (replica == null) {
+
             throw new IllegalArgumentException(
                     "Partition replica not found"
             );
         }
 
-        if (offset < 0 || offset >= replica.nextOffset()) {
+        if (offset < 0
+                || offset >= replica.nextOffset()) {
+
             return null;
         }
 
@@ -205,6 +229,7 @@ public class ReplicationManager implements AutoCloseable {
                 );
 
         if (partitionMetadata == null) {
+
             throw new IllegalArgumentException(
                     "Partition metadata not found"
             );
@@ -217,6 +242,16 @@ public class ReplicationManager implements AutoCloseable {
                 continue;
             }
 
+            /*
+             * Dead brokers are intentionally skipped.
+             * This is failover behavior, not quorum consensus.
+             */
+            if (!clusterMetadata.isBrokerAlive(
+                    followerBrokerId)) {
+
+                continue;
+            }
+
             BrokerInfo follower =
                     clusterMetadata.getBroker(
                             followerBrokerId
@@ -226,7 +261,7 @@ public class ReplicationManager implements AutoCloseable {
                 continue;
             }
 
-            if (follower.getPort() == 0) {
+            if (follower.getPort() <= 0) {
                 continue;
             }
 
@@ -246,43 +281,60 @@ public class ReplicationManager implements AutoCloseable {
                             replicateRequest.encode()
                     );
 
-            ProtocolFrame response =
-                    BrokerClient.request(
-                            follower,
-                            request
+            try {
+
+                ProtocolFrame response =
+                        BrokerClient.request(
+                                follower,
+                                request
+                        );
+
+                if (response.getRequestType()
+                        != RequestType.REPLICATE) {
+
+                    throw new IOException(
+                            "Invalid replication response from broker "
+                                    + followerBrokerId
                     );
+                }
 
-            if (response.getRequestType()
-                    != RequestType.REPLICATE) {
+                if (response.getPayload().length
+                        != Long.BYTES) {
 
-                throw new IOException(
-                        "Invalid replication response from broker "
-                                + followerBrokerId
-                );
-            }
+                    throw new IOException(
+                            "Invalid replication acknowledgement"
+                    );
+                }
 
-            if (response.getPayload().length
-                    != Long.BYTES) {
+                long acknowledgedOffset =
+                        ByteBuffer
+                                .wrap(response.getPayload())
+                                .getLong();
 
-                throw new IOException(
-                        "Invalid replication acknowledgement"
-                );
-            }
+                if (acknowledgedOffset
+                        != offset) {
 
-            long acknowledgedOffset =
-                    ByteBuffer
-                            .wrap(response.getPayload())
-                            .getLong();
+                    throw new IOException(
+                            "Follower "
+                                    + followerBrokerId
+                                    + " acknowledged offset "
+                                    + acknowledgedOffset
+                                    + " instead of "
+                                    + offset
+                    );
+                }
 
-            if (acknowledgedOffset != offset) {
+            } catch (IOException e) {
 
-                throw new IOException(
-                        "Follower "
-                                + followerBrokerId
-                                + " acknowledged offset "
-                                + acknowledgedOffset
-                                + " instead of "
-                                + offset
+                /*
+                 * A follower can disappear between the
+                 * liveness check and the replication request.
+                 *
+                 * Mark it dead and continue with the remaining
+                 * live replicas.
+                 */
+                clusterMetadata.markBrokerDead(
+                        followerBrokerId
                 );
             }
         }
@@ -296,9 +348,13 @@ public class ReplicationManager implements AutoCloseable {
             throws IOException {
 
         PartitionReplica replica =
-                getLocalReplica(topic, partition);
+                getLocalReplica(
+                        topic,
+                        partition
+                );
 
         if (replica == null) {
+
             throw new IllegalArgumentException(
                     "Partition replica not found"
             );
@@ -316,9 +372,13 @@ public class ReplicationManager implements AutoCloseable {
             int leaderBrokerId) {
 
         PartitionMetadata m =
-                getMetadata(topic, partition);
+                getMetadata(
+                        topic,
+                        partition
+                );
 
         if (m == null) {
+
             throw new IllegalArgumentException(
                     "Partition metadata not found"
             );
@@ -335,6 +395,7 @@ public class ReplicationManager implements AutoCloseable {
                 );
 
         if (replica != null) {
+
             replica.setLeader(
                     brokerId == leaderBrokerId
             );
@@ -342,6 +403,7 @@ public class ReplicationManager implements AutoCloseable {
     }
 
     public List<String> localPartitions() {
+
         return new ArrayList<>(
                 replicas.keySet()
         );
@@ -358,14 +420,18 @@ public class ReplicationManager implements AutoCloseable {
     public void close()
             throws IOException {
 
-        IOException firstException = null;
+        IOException firstException =
+                null;
 
         for (PartitionReplica replica :
                 replicas.values()) {
 
             try {
+
                 replica.close();
+
             } catch (IOException e) {
+
                 if (firstException == null) {
                     firstException = e;
                 }
