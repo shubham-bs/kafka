@@ -1,5 +1,8 @@
 package com.kafka.broker;
 
+import com.kafka.storage.LogRecord;
+import com.kafka.storage.PartitionLog;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +23,7 @@ public class TopicManager implements AutoCloseable {
     }
 
     public Topic getOrCreateTopic(String topicName) throws IOException {
+
         validateTopicName(topicName);
 
         Topic existing = topics.get(topicName);
@@ -42,6 +46,7 @@ public class TopicManager implements AutoCloseable {
     }
 
     public long produce(String topicName, int partition, byte[] payload) throws IOException {
+
         if (payload == null) {
             throw new IllegalArgumentException("Payload cannot be null");
         }
@@ -51,11 +56,25 @@ public class TopicManager implements AutoCloseable {
         return topic.getPartition(partition).append(payload);
     }
 
+    public FetchResult fetch(String topicName, int partition, long offset) throws IOException {
+
+        Topic topic = getOrCreateTopic(topicName);
+
+        PartitionLog partitionLog = topic.getPartition(partition);
+
+        if (offset >= partitionLog.nextOffset()) return null;
+
+        LogRecord record = partitionLog.read(offset);
+
+        return new FetchResult(record.getOffset(), record.getPayload());
+    }
+
     public int topicCount() {
         return topics.size();
     }
 
     private void validateTopicName(String topicName) {
+
         if (topicName == null || topicName.isBlank()) {
             throw new IllegalArgumentException("Topic name cannot be empty");
         }
@@ -67,9 +86,11 @@ public class TopicManager implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+
         IOException firstException = null;
 
         for (Topic topic : topics.values()) {
+
             try {
                 topic.close();
             } catch (IOException e) {
