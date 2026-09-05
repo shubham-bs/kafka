@@ -14,18 +14,26 @@ public class ClientConnection implements Runnable {
     private final TopicManager topicManager;
     private final ReplicationManager replicationManager;
     private final ClusterMetadata clusterMetadata;
+    private final BrokerMetrics metrics;
 
     public ClientConnection(int connectionId, Socket socket, TopicManager topicManager,
                             ReplicationManager replicationManager, ClusterMetadata clusterMetadata) {
+        this(connectionId, socket, topicManager, replicationManager, clusterMetadata, new BrokerMetrics());
+    }
+
+    public ClientConnection(int connectionId, Socket socket, TopicManager topicManager,
+                            ReplicationManager replicationManager, ClusterMetadata clusterMetadata,
+                            BrokerMetrics metrics) {
         this.connectionId = connectionId;
         this.socket = socket;
         this.topicManager = topicManager;
         this.replicationManager = replicationManager;
         this.clusterMetadata = clusterMetadata;
+        this.metrics = metrics;
     }
 
     public ClientConnection(int connectionId, Socket socket, TopicManager topicManager) {
-        this(connectionId, socket, topicManager, null, null);
+        this(connectionId, socket, topicManager, null, null, new BrokerMetrics());
     }
 
     @Override
@@ -52,6 +60,7 @@ public class ClientConnection implements Runnable {
     }
 
     private void handleRequest(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
+        metrics.request(request.getRequestType());
         switch (request.getRequestType()) {
             case PING -> handlePing(request, encoder);
             case PRODUCE -> handleProduce(request, encoder);
@@ -66,11 +75,13 @@ public class ClientConnection implements Runnable {
 
     private void handleProduce(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
         try {
+            long started = System.nanoTime();
             ProduceRequest r = ProduceRequest.decode(request.getPayload());
 
             if (!clustered()) {
-                sendProduceResponse(request, encoder,
-                        topicManager.produce(r.getTopic(), r.getPartition(), r.getPayload()));
+                long offset = topicManager.produce(r.getTopic(), r.getPartition(), r.getPayload());
+                metrics.recordProduce(r.getPayload().length, System.nanoTime() - started);
+                sendProduceResponse(request, encoder, offset);
                 return;
             }
 
@@ -78,8 +89,9 @@ public class ClientConnection implements Runnable {
                     clusterMetadata.getPartition(r.getTopic(), r.getPartition());
 
             if (metadata == null) {
-                sendProduceResponse(request, encoder,
-                        topicManager.produce(r.getTopic(), r.getPartition(), r.getPayload()));
+                long offset = topicManager.produce(r.getTopic(), r.getPartition(), r.getPayload());
+                metrics.recordProduce(r.getPayload().length, System.nanoTime() - started);
+                sendProduceResponse(request, encoder, offset);
                 return;
             }
 
@@ -97,6 +109,7 @@ public class ClientConnection implements Runnable {
             replicationManager.replicate(
                     r.getTopic(), r.getPartition(), offset, r.getPayload());
 
+            metrics.recordProduce(r.getPayload().length, System.nanoTime() - started);
             sendProduceResponse(request, encoder, offset);
         } catch (IllegalArgumentException | IllegalStateException e) {
             sendErrorResponse(request, encoder, e.getMessage());
@@ -105,11 +118,13 @@ public class ClientConnection implements Runnable {
 
     private void handleFetch(ProtocolFrame request, ProtocolEncoder encoder) throws IOException {
         try {
+            long started = System.nanoTime();
             FetchRequest r = FetchRequest.decode(request.getPayload());
 
             if (!clustered()) {
-                sendFetchResponse(request, encoder,
-                        topicManager.fetch(r.getTopic(), r.getPartition(), r.getOffset()));
+                FetchResult result = topicManager.fetch(r.getTopic(), r.getPartition(), r.getOffset());
+                metrics.recordFetch(result == null ? 0 : result.getPayload().length, System.nanoTime() - started);
+                sendFetchResponse(request, encoder, result);
                 return;
             }
 
@@ -117,8 +132,9 @@ public class ClientConnection implements Runnable {
                     clusterMetadata.getPartition(r.getTopic(), r.getPartition());
 
             if (metadata == null) {
-                sendFetchResponse(request, encoder,
-                        topicManager.fetch(r.getTopic(), r.getPartition(), r.getOffset()));
+                FetchResult result = topicManager.fetch(r.getTopic(), r.getPartition(), r.getOffset());
+                metrics.recordFetch(result == null ? 0 : result.getPayload().length, System.nanoTime() - started);
+                sendFetchResponse(request, encoder, result);
                 return;
             }
 
@@ -133,8 +149,9 @@ public class ClientConnection implements Runnable {
             LogRecord record = replicationManager.fetchLocally(
                     r.getTopic(), r.getPartition(), r.getOffset());
 
-            sendFetchResponse(request, encoder,
-                    record == null ? null : new FetchResult(r.getOffset(), record.getPayload()));
+            FetchResult result = record == null ? null : new FetchResult(r.getOffset(), record.getPayload());
+            metrics.recordFetch(result == null ? 0 : result.getPayload().length, System.nanoTime() - started);
+            sendFetchResponse(request, encoder, result);
         } catch (IllegalArgumentException | IllegalStateException e) {
             sendErrorResponse(request, encoder, e.getMessage());
         }

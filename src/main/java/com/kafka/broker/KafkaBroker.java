@@ -30,6 +30,7 @@ public class KafkaBroker {
     private final ReplicationManager replicationManager;
 
     private final FailureDetector failureDetector;
+    private final BrokerMetrics metrics = new BrokerMetrics();
 
     private volatile boolean running;
 
@@ -160,6 +161,8 @@ public class KafkaBroker {
                         connectionCounter
                                 .incrementAndGet();
 
+                metrics.connectionAccepted();
+
                 System.out.println(
                         "Accepted connection #"
                                 + connectionId
@@ -178,7 +181,8 @@ public class KafkaBroker {
                                 clientSocket,
                                 topicManager,
                                 replicationManager,
-                                clusterMetadata
+                                clusterMetadata,
+                                metrics
                         )
                 );
             }
@@ -217,6 +221,10 @@ public class KafkaBroker {
         }
 
         return currentSocket.getLocalPort();
+    }
+
+    public BrokerMetrics.Snapshot getMetrics() {
+        return metrics.snapshot();
     }
 
     public TopicManager getTopicManager() {
